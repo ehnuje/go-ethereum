@@ -58,6 +58,9 @@ var secureKeyPrefix = []byte("secure-key-")
 // secureKeyLength is the length of the above prefix + 32byte hash.
 const secureKeyLength = 11 + 32
 
+// commitResultChSizeLimit limits the size of channel used for commitResult.
+const commitResultChSizeLimit = 10000
+
 // Database is an intermediate write layer between the trie data structures and
 // the disk database. The aim is to accumulate trie writes in-memory and only
 // periodically flush a couple tries to disk, garbage collecting the remainder.
@@ -766,6 +769,80 @@ func (db *Database) Commit(node common.Hash, report bool) error {
 	db.flushnodes, db.flushsize, db.flushtime = 0, 0, 0
 
 	return nil
+}
+
+// commitResult contains the result from concurrent commit calls.
+// key and val are nil if the commitResult indicates the end of
+// concurrentCommit goroutine.
+type commitResult struct {
+	key []byte
+	val []byte
+}
+
+func (db *Database) commitManager(hash common.Hash, batch ethdb.Batch, uncacher *cleaner) error {
+	rootNode, ok := db.dirties[hash]
+	if !ok {
+		return nil
+	}
+	// To limit the size of commitResult channel, we use commitResultChSizeLimit here.
+	var resultCh chan commitResult
+	if len(db.dirties) > commitResultChSizeLimit {
+		resultCh = make(chan commitResult, commitResultChSizeLimit)
+	} else {
+		resultCh = make(chan commitResult, len(db.dirties))
+	}
+
+	numGoRoutines := len(rootNode.childs())
+	for i, child := range rootNode.childs() {
+		go db.rootCommit(child, resultCh, i)
+	}
+	for numGoRoutines > 0 {
+		result := <-resultCh
+		if result.key == nil && result.val == nil {
+			numGoRoutines--
+			continue
+		}
+		if err := batch.Put(result.key, result.val); err != nil {
+			return err
+		}
+		if batch.ValueSize() >= ethdb.IdealBatchSize {
+			if err := batch.Write(); err != nil {
+				return err
+			}
+			db.lock.Lock()
+			batch.Replay(uncacher)
+			batch.Reset()
+			db.lock.Unlock()
+		}
+	}
+	enc := rootNode.rlp()
+	if err := batch.Put(hash[:], enc); err != nil {
+		return err
+	}
+	if err := batch.Write(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (db *Database) rootCommit(hash common.Hash, resultCh chan commitResult, childIndex int) {
+	log.Trace("rootCommit start", "childIndex", childIndex)
+	db.individualCommit(hash, resultCh)
+	resultCh <- commitResult{nil, nil} // {nil, nil} result indicates the termination of a rootCommit goroutine
+	log.Trace("rootCommit end", "childIndex", childIndex)
+}
+
+func (db *Database) individualCommit(hash common.Hash, resultCh chan<- commitResult) {
+	// If the node does not exist, it's a previously committed node
+	node, ok := db.dirties[hash]
+	if !ok {
+		return
+	}
+	for _, child := range node.childs() {
+		db.individualCommit(child, resultCh)
+	}
+	enc := node.rlp()
+	resultCh <- commitResult{hash[:], enc}
 }
 
 // commit is the private locked version of Commit.
